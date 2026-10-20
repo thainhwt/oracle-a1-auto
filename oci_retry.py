@@ -1,47 +1,53 @@
-import oci
-import time
+"""Retry a single Snoopy A1 launch when OCI reports no host capacity."""
+
 import datetime
+import os
+import time
 
-# ╔══════════════════════════════════════════════════════╗
-# ║  Target : VM.Standard.A1.Flex (ARM)                  ║
-# ║  Spec   : 2 OCPU / 12 GB RAM / 100 GB disk (default) ║
-# ║  Arch   : ARM (Ampere)                               ║
-# ║  Tier   : Oracle Always Free                         ║
-# ║  OS     : Canonical Ubuntu 22.04                     ║
-# ╚══════════════════════════════════════════════════════╝
-
-# ─── Configuration ───────────────────────────────────────
-COMPARTMENT_ID = (
-    "ocid1.tenancy.oc1..aaaaaaaaaqij5zlnm3v5qprvdll3j7nc6o3dk4ykzerugzxe37ckajkpjxpa"  # Replace with your tenancy OCID
-)
-SSH_PUBLIC_KEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDdsLT/y7kupelr7rr+NcIyPVb4ZC20x9L5VuNMC5aYlXmSuqJQemXzdzfvp5F899CNdBe+TJJ+w55ka6C5J8vZTMmT4IfIOKZdJsKaTwOCbYTRz62PLcq90veNBPdn0kcnUxrqD3ReKxkKhyyL9WIWH1+4e945w9TL2wgr7Os0rYN5q/4Sa6ioof1I4NE9lGw+WL2yjOI0YLQXmWnvRb7qcQUdOCxgbOXw3GsPFwp3UZ+yJm8kbwFzJdTojaUeriuk3HQYFjzaOVN07kmf2vTQKSgsyw5B+BhyeYQmcRtNTNiriZ7skfS06/24ZM/hzLBz7/PQgw0DoRHDWB5YbyT1 ssh-key-2026-03-05"  # Replace with your SSH public key (.pub file content)
-INSTANCE_NAME = "streamlit-server"
-ARM_OCPUS = 2
-ARM_MEMORY_IN_GBS = 12
-BOOT_VOLUME_SIZE_IN_GBS = 100
-RETRY_INTERVAL = 90  # seconds
-# ────────────────────────────────────────────────────────
-
-# ─── OCI Authentication ──────────────────────────────────
-# [Local] Create a config file at ~/.oci/config
-#   See README.md for format; key_file should point to your API private key .pem
-#
-# [GitHub Actions] No config file needed
-#   The workflow auto-creates it from GitHub Secrets — see README.md
-# ────────────────────────────────────────────────────────
-config = oci.config.from_file()
+import oci
+import requests
 
 
-def get_availability_domain():
+INSTANCE_NAME = "snoopy-a1"
+ARM_OCPUS = 1
+ARM_MEMORY_IN_GBS = 6
+BOOT_VOLUME_SIZE_IN_GBS = 50
+RETRY_INTERVAL = 300
+
+
+def required(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise ValueError(f"Missing required GitHub Actions secret: {name}")
+    return value
+
+
+def main():
+    compartment_id = required("OCI_COMPARTMENT_ID")
+    subnet_id = required("OCI_SUBNET_ID")
+    ssh_public_key = required("A1_SSH_PUBLIC_KEY")
+    if not ssh_public_key.startswith(("ssh-rsa ", "ssh-ed25519 ", "ecdsa-sha2-")):
+        raise ValueError("A1_SSH_PUBLIC_KEY must contain a public SSH key, not a private key")
+
+    config = oci.config.from_file()
+    oci.config.validate_config(config)
     identity = oci.identity.IdentityClient(config)
-    ads = identity.list_availability_domains(COMPARTMENT_ID).data
-    return ads[0].name
-
-
-def get_ubuntu_arm_image():
     compute = oci.core.ComputeClient(config)
+    network = oci.core.VirtualNetworkClient(config)
+
+    subnet = network.get_subnet(subnet_id).data
+    if subnet.compartment_id != compartment_id:
+        raise ValueError("OCI_SUBNET_ID must be in OCI_COMPARTMENT_ID")
+    if subnet.prohibit_public_ip_on_vnic:
+        raise ValueError("OCI_SUBNET_ID must allow public IP addresses")
+
+    domains = identity.list_availability_domains(compartment_id).data
+    if not domains:
+        raise RuntimeError("No availability domain found in this region")
+    ad_name = domains[0].name
+
     images = compute.list_images(
-        COMPARTMENT_ID,
+        compartment_id,
         operating_system="Canonical Ubuntu",
         operating_system_version="22.04",
         shape="VM.Standard.A1.Flex",
@@ -49,157 +55,63 @@ def get_ubuntu_arm_image():
         sort_order="DESC",
     ).data
     if not images:
-        raise Exception("Ubuntu 22.04 ARM image not found")
-    return images[0].id
+        raise RuntimeError("No compatible Ubuntu 22.04 Arm image found")
+    image_id = images[0].id
 
-
-def create_vcn_and_subnet():
-    network = oci.core.VirtualNetworkClient(config)
-
-    # Check if VCN already exists
-    vcns = network.list_vcns(COMPARTMENT_ID, display_name="retry-vcn").data
-    if vcns:
-        vcn = vcns[0]
-        print(f"Using existing VCN: {vcn.id}")
-    else:
-        vcn = network.create_vcn(
-            oci.core.models.CreateVcnDetails(
-                compartment_id=COMPARTMENT_ID,
-                display_name="retry-vcn",
-                cidr_block="10.0.0.0/16",
-            )
+    def find_existing():
+        instances = oci.pagination.list_call_get_all_results(
+            compute.list_instances, compartment_id, display_name=INSTANCE_NAME
         ).data
-        print(f"Created VCN: {vcn.id}")
-
-        # Create Internet Gateway
-        ig = network.create_internet_gateway(
-            oci.core.models.CreateInternetGatewayDetails(
-                compartment_id=COMPARTMENT_ID,
-                vcn_id=vcn.id,
-                display_name="retry-ig",
-                is_enabled=True,
-            )
-        ).data
-
-        # Update route table to allow outbound traffic
-        network.update_route_table(
-            vcn.default_route_table_id,
-            oci.core.models.UpdateRouteTableDetails(
-                route_rules=[
-                    oci.core.models.RouteRule(
-                        destination="0.0.0.0/0",
-                        network_entity_id=ig.id,
-                    )
-                ]
+        return next(
+            (
+                instance for instance in instances
+                if instance.display_name == INSTANCE_NAME
+                and instance.shape == "VM.Standard.A1.Flex"
+                and instance.lifecycle_state not in ("TERMINATED", "TERMINATING")
             ),
+            None,
         )
-
-        # Open inbound ports: SSH / HTTP / HTTPS / Streamlit
-        security_lists = network.list_security_lists(COMPARTMENT_ID, vcn_id=vcn.id).data
-        if security_lists:
-            existing_egress = security_lists[0].egress_security_rules
-            new_ingress = []
-            for port in [22, 80, 443, 8501]:
-                new_ingress.append(
-                    oci.core.models.IngressSecurityRule(
-                        protocol="6",
-                        source="0.0.0.0/0",
-                        tcp_options=oci.core.models.TcpOptions(
-                            destination_port_range=oci.core.models.PortRange(
-                                min=port, max=port
-                            )
-                        ),
-                    )
-                )
-            network.update_security_list(
-                security_lists[0].id,
-                oci.core.models.UpdateSecurityListDetails(
-                    ingress_security_rules=new_ingress,
-                    egress_security_rules=existing_egress,
-                ),
-            )
-
-    # Check if subnet already exists
-    subnets = network.list_subnets(
-        COMPARTMENT_ID, vcn_id=vcn.id, display_name="retry-subnet"
-    ).data
-    if subnets:
-        subnet = subnets[0]
-        print(f"Using existing subnet: {subnet.id}")
-    else:
-        subnet = network.create_subnet(
-            oci.core.models.CreateSubnetDetails(
-                compartment_id=COMPARTMENT_ID,
-                vcn_id=vcn.id,
-                display_name="retry-subnet",
-                cidr_block="10.0.0.0/24",
-                prohibit_public_ip_on_vnic=False,
-            )
-        ).data
-        print(f"Created subnet: {subnet.id}")
-
-    return subnet.id
-
-
-def try_create_instance(subnet_id, ad_name, image_id):
-    compute = oci.core.ComputeClient(config)
-    instance = compute.launch_instance(
-        oci.core.models.LaunchInstanceDetails(
-            compartment_id=COMPARTMENT_ID,
-            display_name=INSTANCE_NAME,
-            availability_domain=ad_name,
-            shape="VM.Standard.A1.Flex",
-            shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
-                ocpus=ARM_OCPUS,
-                memory_in_gbs=ARM_MEMORY_IN_GBS,
-            ),
-            source_details=oci.core.models.InstanceSourceViaImageDetails(
-                image_id=image_id,
-                boot_volume_size_in_gbs=BOOT_VOLUME_SIZE_IN_GBS,
-            ),
-            create_vnic_details=oci.core.models.CreateVnicDetails(
-                subnet_id=subnet_id,
-                assign_public_ip=True,
-            ),
-            metadata={"ssh_authorized_keys": SSH_PUBLIC_KEY},
-        )
-    ).data
-    return instance
-
-
-def main():
-    print("Initializing network configuration...")
-    subnet_id = create_vcn_and_subnet()
-
-    print("Fetching availability domain...")
-    ad_name = get_availability_domain()
-    print(f"AD: {ad_name}")
-
-    print("Fetching Ubuntu 22.04 ARM image...")
-    image_id = get_ubuntu_arm_image()
-    print(f"Image ID: {image_id}")
 
     attempt = 0
     while True:
+        existing = find_existing()
+        if existing:
+            print(f"A1 already exists ({existing.lifecycle_state}): {existing.id}")
+            return
+
         attempt += 1
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[{now}] Attempt #{attempt} to create instance...")
-
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        print(f"[{now}] Attempt #{attempt} to launch {INSTANCE_NAME}", flush=True)
         try:
-            instance = try_create_instance(subnet_id, ad_name, image_id)
-            print(f"\n✅ Success! Instance created")
-            print(f"   ID: {instance.id}")
-            print(f"   State: {instance.lifecycle_state}")
-            print(f"   Check Oracle Cloud Console for the public IP")
-            break
-        except oci.exceptions.ServiceError as e:
-            if "Out of host capacity" in str(e) or "capacity" in str(e).lower():
-                print(f"❌ Out of capacity, retrying...")
+            instance = compute.launch_instance(
+                oci.core.models.LaunchInstanceDetails(
+                    compartment_id=compartment_id,
+                    display_name=INSTANCE_NAME,
+                    availability_domain=ad_name,
+                    shape="VM.Standard.A1.Flex",
+                    shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
+                        ocpus=ARM_OCPUS, memory_in_gbs=ARM_MEMORY_IN_GBS
+                    ),
+                    source_details=oci.core.models.InstanceSourceViaImageDetails(
+                        image_id=image_id,
+                        boot_volume_size_in_gbs=BOOT_VOLUME_SIZE_IN_GBS,
+                    ),
+                    create_vnic_details=oci.core.models.CreateVnicDetails(
+                        subnet_id=subnet_id, assign_public_ip=True
+                    ),
+                    metadata={"ssh_authorized_keys": ssh_public_key},
+                )
+            ).data
+            print(f"Created A1 ({instance.lifecycle_state}): {instance.id}", flush=True)
+            return
+        except oci.exceptions.ServiceError as exc:
+            message = (exc.message or "").lower()
+            if exc.code == "OutOfHostCapacity" or "out of host capacity" in message:
+                print("Out of host capacity; trying again later", flush=True)
             else:
-                print(f"❌ API error: {e.message}, retrying...")
-        except Exception as e:
-            print(f"⚠️ Network timeout or other error, retrying... ({type(e).__name__})")
-
+                raise
+        except requests.exceptions.RequestException as exc:
+            print(f"Temporary connection error ({type(exc).__name__}); checking again later", flush=True)
         time.sleep(RETRY_INTERVAL)
 
 
