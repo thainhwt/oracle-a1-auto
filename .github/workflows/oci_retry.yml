@@ -1,21 +1,22 @@
 name: OCI ARM Retry
 
 on:
-  workflow_dispatch:  # Manual trigger only
+  workflow_dispatch:
 
 concurrency:
-  group: oci-retry            # Only one Job allowed per group
-  cancel-in-progress: false   # Do not cancel running jobs; new ones queue (max 1 running + 1 waiting)
+  group: oci-a1-retry
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   retry:
     runs-on: ubuntu-latest
-    timeout-minutes: 355      # Close to GitHub Actions 6-hour limit
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # Suppress Node.js 20 deprecation warning
-
+    timeout-minutes: 355
     steps:
-      - name: Checkout
+      - name: Check out this repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -24,57 +25,74 @@ jobs:
           python-version: '3.11'
 
       - name: Install OCI SDK
-        run: pip install oci
+        run: python -m pip install oci
 
       - name: Set up OCI credentials
         env:
-          OCI_USER:        ${{ secrets.OCI_USER }}
+          OCI_USER: ${{ secrets.OCI_USER }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-          OCI_TENANCY:     ${{ secrets.OCI_TENANCY }}
-          OCI_REGION:      ${{ secrets.OCI_REGION }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
         run: |
+          set -euo pipefail
+          for item in OCI_USER OCI_FINGERPRINT OCI_TENANCY OCI_REGION OCI_PRIVATE_KEY; do
+            if [[ -z "${!item}" ]]; then
+              echo "Missing GitHub Actions secret: $item" >&2
+              exit 1
+            fi
+          done
           mkdir -p ~/.oci
-
-          # Write API private key
-          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 700 ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
-
-          # Write config (key_file uses absolute path)
           cat > ~/.oci/config << EOF
           [DEFAULT]
           user=$OCI_USER
           fingerprint=$OCI_FINGERPRINT
           tenancy=$OCI_TENANCY
           region=$OCI_REGION
-          key_file=/home/runner/.oci/oci_api_key.pem
+          key_file=$HOME/.oci/oci_api_key.pem
           EOF
+          chmod 600 ~/.oci/config
 
-      - name: Run OCI retry script
-        # Script succeeds (exit 0)  → next step auto-disables the workflow
-        # Timeout expires (exit 124) → treated as failure, triggers next Job
-        # timeout 19800s = 330 min, 25 min less than job timeout 355 min (buffer for setup steps)
-        id: run_script
-        continue-on-error: true
+      - name: Try creating one A1
+        id: attempt
         env:
-          PYTHONUNBUFFERED: "1"
-        run: timeout 19800 python oci_retry.py
-
-      - name: Auto-disable workflow on success
-        if: steps.run_script.outcome == 'success'
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          A1_SSH_PUBLIC_KEY: ${{ secrets.A1_SSH_PUBLIC_KEY }}
+          PYTHONUNBUFFERED: '1'
         run: |
-          curl -s -X PUT \
-            -H "Authorization: token ${{ secrets.GH_PAT }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/disable
-          echo "Workflow auto-disabled"
+          set +e
+          timeout 19800 python oci_retry.py
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
 
-      - name: Trigger next Job (seamless relay)
-        if: steps.run_script.outcome != 'success'
+      - name: Stop retry workflow after success
+        if: ${{ steps.attempt.outputs.code == '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -s -X POST \
-            -H "Authorization: token ${{ secrets.GH_PAT }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/dispatches \
+          curl --fail-with-body -sS -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/disable"
+
+      - name: Start next retry session after timeout
+        if: ${{ steps.attempt.outputs.code == '124' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/dispatches" \
             -d '{"ref":"main"}'
-          echo "Next Job triggered"
+
+      - name: Report configuration or API error
+        if: ${{ steps.attempt.outputs.code != '0' && steps.attempt.outputs.code != '124' }}
+        run: |
+          echo "A1 retry stopped because configuration or OCI API failed. Check the step above." >&2
+          exit 1
