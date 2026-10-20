@@ -25,7 +25,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install OCI SDK
-        run: python -m pip install oci
+        run: python -m pip install oci requests
 
       - name: Set up OCI credentials
         env:
